@@ -70,11 +70,14 @@ const {
 } = require('./lib/freeTierPolicy');
 
 const { createFreeTierAccounting } = require('./lib/freeTierAccounting');
+const { createPaidTierAccounting } = require('./lib/paidTierAccounting');
 
-const { MODEL_IDS, MODELS_BY_TIER, getDeepInfraModelId, authorizeModel, mergeModelCaps, getModelAccessError } = require('./lib/modelCatalog');
+const { MODEL_IDS, MODELS_BY_TIER, MODEL_BALANCES_BY_TIER, MODEL_BALANCE_TOTALS_BY_TIER, getDeepInfraModelId, authorizeModel, mergeModelCaps, getModelAccessError } = require('./lib/modelCatalog');
 const { mapProviderStatus } = require('./lib/providerErrors');
 const { verifyNowPaymentsSignature, matchesRegisteredInvoice, normalizePayCurrency, isSupportedPayCurrency } = require('./lib/nowpayments');
 const { buildDeepInfraRequestBody } = require('./lib/deepinfraRequest');
+const { TIER_PRICES_USD } = require('./lib/tierPricing');
+const { evaluateTierQuota, getMaxCompletionTokens } = require('./lib/tierQuota');
 
 
 
@@ -336,6 +339,7 @@ const supabase = createClient(
 
 
 const freeTierAccounting = createFreeTierAccounting(supabase);
+const paidTierAccounting = createPaidTierAccounting(supabase);
 
 
 
@@ -354,7 +358,7 @@ const freeTierAccounting = createFreeTierAccounting(supabase);
 // FREE:    100,000 LIFETIME tokens. Model: qwen/qwen3-coder-30b-a3b-instruct
 // LEARNER: 2,000,000 monthly tokens ($3.00). Model: deepseek/deepseek-v4.1-flash-1017
 // STARTER: 8,000,000 monthly tokens ($8.00). Split: 4M deepseek flash + 4M mimo-v2.6-flash
-// PRO:     12,000,000 monthly tokens ($13.00). Split: 4M deepseek v4.5 + 4M grok-4.1-fast + 4M mimo-v2.6-flash
+// PRO:     12,000,000 monthly tokens ($14.00). Split: 4M deepseek v4.5 + 4M grok-4.1-fast + 4M mimo-v2.6-flash
 // ---------------------------------------------------------------------------
 const TIER_CONFIG = {
   free: {
@@ -369,7 +373,7 @@ const TIER_CONFIG = {
   },
   learner: {
     name: 'Learner',
-    priceUsd: 3.00,
+    priceUsd: TIER_PRICES_USD.learner,
     totalTokens: 2000000,
     isLifetime: false,
     allowedModels: MODELS_BY_TIER.learner,
@@ -380,29 +384,19 @@ const TIER_CONFIG = {
   },
   starter: {
     name: 'Starter',
-    priceUsd: 8.00,
-    totalTokens: 8000000,
+    priceUsd: TIER_PRICES_USD.starter,
+    totalTokens: MODEL_BALANCE_TOTALS_BY_TIER.starter,
     isLifetime: false,
     allowedModels: MODELS_BY_TIER.starter,
-    modelBalances: {
-      [MODEL_IDS.FREE]: 2666667,
-      [MODEL_IDS.STARTER_DEEPSEEK]: 2666667,
-      [MODEL_IDS.STARTER_MIMO]: 2666666
-    }
+    modelBalances: MODEL_BALANCES_BY_TIER.starter
   },
   pro: {
     name: 'Pro',
-    priceUsd: 13.00,
-    totalTokens: 12000000,
+    priceUsd: TIER_PRICES_USD.pro,
+    totalTokens: MODEL_BALANCE_TOTALS_BY_TIER.pro,
     isLifetime: false,
     allowedModels: MODELS_BY_TIER.pro,
-    modelBalances: {
-      [MODEL_IDS.FREE]: 2400000,
-      [MODEL_IDS.STARTER_DEEPSEEK]: 2400000,
-      [MODEL_IDS.STARTER_MIMO]: 2400000,
-      [MODEL_IDS.PRO_DEEPSEEK]: 2400000,
-      [MODEL_IDS.PRO_MIMO]: 2400000
-    }
+    modelBalances: MODEL_BALANCES_BY_TIER.pro
   }
 };
 
@@ -418,17 +412,11 @@ const tierCaps = {
   },
 
   starter: {
-    [MODEL_IDS.FREE]: 2666667,
-    [MODEL_IDS.STARTER_DEEPSEEK]: 2666667,
-    [MODEL_IDS.STARTER_MIMO]: 2666666
+    ...MODEL_BALANCES_BY_TIER.starter
   },
 
   pro: {
-    [MODEL_IDS.FREE]: 2400000,
-    [MODEL_IDS.STARTER_DEEPSEEK]: 2400000,
-    [MODEL_IDS.STARTER_MIMO]: 2400000,
-    [MODEL_IDS.PRO_DEEPSEEK]: 2400000,
-    [MODEL_IDS.PRO_MIMO]: 2400000
+    ...MODEL_BALANCES_BY_TIER.pro
   }
 
 };
@@ -653,7 +641,7 @@ async function authenticate(req, res, next) {
 
 // ---------------------------------------------------------------------------
 
-async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel = null, hasImages = false, estimatedTokens = 1000 } = {}) {
+async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel = null, hasImages = false, estimatedTokens = 1000, maxCompletionTokens = 0 } = {}) {
 
   // 1. Get user's active subscription
 
@@ -712,7 +700,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
   }
 
-  const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
+  const cycleStart = subscription && subscription.cycle_start ? subscription.cycle_start : new Date(0).toISOString();
 
 
 
@@ -872,9 +860,13 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
   // 2. Fetch usage grouped by model for current cycle
 
-  const currentTierCaps = mergeModelCaps(tierCaps[tier] || tierCaps.learner, subscription?.model_balances);
+  const paidEstimatedTokens = estimatedTokens + maxCompletionTokens;
+
+  const currentTierCaps = mergeModelCaps(tierCaps[tier] || tierCaps.learner, subscription?.model_balances, MODELS_BY_TIER[tier]);
 
   const modelUsage = {};
+
+  let totalUsage = 0;
 
 
 
@@ -904,6 +896,8 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
         modelUsage[m] = (modelUsage[m] || 0) + total;
 
+        totalUsage += total;
+
       }
 
     }
@@ -918,13 +912,55 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
 
 
+  const tierTotalCap = TIER_CONFIG[tier]?.totalTokens || 0;
+
+  const tierQuota = evaluateTierQuota({ usedTokens: totalUsage, estimatedTokens: paidEstimatedTokens, cap: tierTotalCap });
+
+  const tierUtilization = tierTotalCap > 0 ? totalUsage / tierTotalCap : 0;
+
+  if (!tierQuota.allowed) {
+
+    return {
+
+      tier,
+
+      targetModel: selectedRequestModel,
+
+      isFreeTier: false,
+
+      allCapsExhausted: true,
+
+      tierCapExceeded: true,
+
+      warning: 'tier_total_cap_exhausted',
+
+      usagePercent: Number((tierUtilization * 100).toFixed(1)),
+
+      currentUsage: totalUsage,
+
+      tierCap: tierTotalCap,
+
+      maxUtilization: tierUtilization,
+
+      capsSummary: {},
+
+      totalUsage,
+
+      totalCap: tierTotalCap,
+
+      cycleStart
+
+    };
+
+  }
+
   // Calculate caps summary and check exhaustion
 
   const capsSummary = {};
 
   let anyPaidRemaining = false;
 
-  let maxUtilization = 0;
+  let maxUtilization = tierUtilization;
 
   const primaryModel = selectedRequestModel || MODEL_IDS.FREE;
 
@@ -958,7 +994,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
 
 
-    if (used + estimatedTokens <= cap) {
+    if (used + paidEstimatedTokens <= cap) {
 
       anyPaidRemaining = true;
 
@@ -1020,7 +1056,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
     const requestedUsed = modelUsage[selectedRequestModel] || 0;
 
-    if (!requestedCap || requestedUsed + estimatedTokens > requestedCap) {
+    if (!requestedCap || requestedUsed + paidEstimatedTokens > requestedCap) {
 
       return {
 
@@ -1064,7 +1100,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
     const proUsed = modelUsage[forceModel] || 0;
 
-    if (proCap && (proUsed + estimatedTokens <= proCap)) {
+    if (proCap && (proUsed + paidEstimatedTokens <= proCap)) {
 
       selectedModel = forceModel;
 
@@ -1090,7 +1126,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
       const qwenUsed = modelUsage[MODEL_IDS.STARTER_MIMO] || 0;
 
-      if (qwenUsed + estimatedTokens <= qwenCap) {
+      if (qwenUsed + paidEstimatedTokens <= qwenCap) {
 
         selectedModel = MODEL_IDS.STARTER_MIMO;
 
@@ -1104,7 +1140,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
     if (!selectedModel) {
 
-      if (currentTierCaps[MODEL_IDS.FREE] && (modelUsage[MODEL_IDS.FREE] + estimatedTokens <= currentTierCaps[MODEL_IDS.FREE])) {
+      if (currentTierCaps[MODEL_IDS.FREE] && (modelUsage[MODEL_IDS.FREE] + paidEstimatedTokens <= currentTierCaps[MODEL_IDS.FREE])) {
 
         selectedModel = MODEL_IDS.FREE;
 
@@ -1114,7 +1150,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
         for (const [m, cap] of Object.entries(currentTierCaps)) {
 
-          if (!PREMIUM_TOGGLE_MODELS.has(m) && ((modelUsage[m] || 0) + estimatedTokens <= cap)) {
+          if (!PREMIUM_TOGGLE_MODELS.has(m) && ((modelUsage[m] || 0) + paidEstimatedTokens <= cap)) {
 
             selectedModel = m;
 
@@ -1164,12 +1200,41 @@ async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel =
 
     tierCap: flashCap,
 
+    modelCap: selectedModel ? currentTierCaps[selectedModel] : 0,
+
+    totalCap: tierTotalCap,
+
+    totalUsage,
+
+    reservationTokens: paidEstimatedTokens,
+
+    promptEstimate: estimatedTokens,
+
+    maxCompletionTokens,
+
+    cycleStart,
+
     maxUtilization,
 
     capsSummary
 
   };
 
+}
+
+async function reservePaidTierRequest(userId, capResult, modelId) {
+  const requestId = crypto.randomUUID();
+  const reservation = await paidTierAccounting.reserve({
+    requestId,
+    userId,
+    tier: capResult.tier,
+    cycleStart: capResult.cycleStart,
+    modelId,
+    estimatedTokens: capResult.reservationTokens,
+    modelCap: capResult.modelCap,
+    totalCap: capResult.totalCap
+  });
+  return { ...reservation, requestId };
 }
 
 
@@ -1478,6 +1543,8 @@ async function pipeSseWithUsage(providerResponse, res, fallbackPromptTokens, onC
 
   let usage = null;
 
+  let sawDone = false;
+
   let finalized = false;
 
 
@@ -1490,7 +1557,11 @@ async function pipeSseWithUsage(providerResponse, res, fallbackPromptTokens, onC
 
     const payload = trimmed.slice(5).trim();
 
-    if (!payload || payload === '[DONE]') return;
+    if (!payload) return;
+    if (payload === '[DONE]') {
+      sawDone = true;
+      return;
+    }
 
     try {
 
@@ -1528,7 +1599,7 @@ async function pipeSseWithUsage(providerResponse, res, fallbackPromptTokens, onC
 
     try {
 
-      await onComplete({ promptTokens, completionTokens });
+      await onComplete({ promptTokens, completionTokens, usageReported: Boolean(usage), streamComplete: sawDone });
 
     } catch (err) {
 
@@ -1701,12 +1772,14 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
 
   let isFreeTierRequest = false;
+  let paidReservationId = null;
 
   try {
 
     // STEP 1: Pre-request cap & routing check — BEFORE any provider call
 
-    const estimatedTokenCount = Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages));
+    const estimatedTokenCount = Math.max(1, estimateMessagesTokens(messages), Number(estimated_tokens) || 0);
+    const maxCompletionTokens = getMaxCompletionTokens(req.body);
 
     const capResult = await checkCapBeforeRoute(userId, {
 
@@ -1716,7 +1789,9 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
       hasImages,
 
-      estimatedTokens: estimatedTokenCount
+      estimatedTokens: estimatedTokenCount,
+
+      maxCompletionTokens
 
     });
 
@@ -1950,7 +2025,7 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
         temperature: req.body.temperature,
 
-        max_tokens: req.body.max_completion_tokens || req.body.max_tokens,
+        max_tokens: maxCompletionTokens,
 
         mockEndpoint: req.headers['x-albion-mock-provider-url'],
 
@@ -2045,8 +2120,29 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
 
     // Paid Cloud Routing: Primary via DeepInfra Native OpenAI-compatible API
+    let paidReservation;
+    try {
+      paidReservation = await reservePaidTierRequest(userId, capResult, targetModel);
+    } catch (err) {
+      console.error(`[CHAT] Paid quota reservation failed (${err.name}).`);
+      return res.status(503).json({ error: 'Usage accounting is temporarily unavailable. Please try again shortly.' });
+    }
+    if (!paidReservation.allowed) {
+      return res.status(402).json({
+        error: 'Your plan token cap is exhausted. Please top up or upgrade to continue.',
+        cap_exceeded: true,
+        tier: capResult.tier,
+        code: paidReservation.status || 'paid_tier_quota_exceeded'
+      });
+    }
+    paidReservationId = paidReservation.requestId;
+
+    // Paid Cloud Routing: Primary via DeepInfra Native OpenAI-compatible API
 
     if (!DEEPINFRA_API_KEY) {
+
+      await paidTierAccounting.release(paidReservationId);
+      paidReservationId = null;
 
       return res.status(503).json({ error: 'AI provider is not configured. Please contact support.' });
 
@@ -2080,7 +2176,9 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
           messages: orderedMessages,
 
-          temperature: 0.2
+          temperature: 0.2,
+
+          max_tokens: maxCompletionTokens
 
         })
 
@@ -2093,6 +2191,10 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
       if (providerResponse.status === 402) {
 
         console.error(`[PAID-ROUTER] DeepInfra returned 402 (wallet top-up required) for user ${userId}. No fallback configured.`);
+
+        await paidTierAccounting.release(paidReservationId);
+
+        paidReservationId = null;
 
         return res.status(503).json({ error: 'AI provider is temporarily unavailable. Please try again shortly.' });
 
@@ -2156,6 +2258,11 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
       if (providerResponse.status === 429) res.setHeader('Retry-After', providerResponse.headers.get('retry-after') || '2');
 
+      if (paidReservationId) {
+        if (providerResponse.status >= 500 || providerResponse.status === 408) await paidTierAccounting.markUncertain(paidReservationId);
+        else await paidTierAccounting.release(paidReservationId);
+        paidReservationId = null;
+      }
       return res.status(mapped.status).json({ error: mapped.message, retry_after: providerResponse.status === 429 ? 2 : undefined });
 
     }
@@ -2166,35 +2273,15 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
 
 
-    // STEP 7: Synchronously log usage BEFORE responding to client (paid models only)
-
-    const { error: logError } = await supabase.from('usage_logs').insert({
-
-      user_id: userId,
-
-      model: targetModel,
-
-      prompt_tokens: data.usage?.prompt_tokens || 0,
-
-      completion_tokens: data.usage?.completion_tokens || 0,
-
-      actual_cost: data.metadata?.cost || 0,
-
-      session_id: session_id || null,
-
-      timestamp: new Date().toISOString()
-
+    const promptTokens = data.usage?.prompt_tokens ?? capResult.promptEstimate;
+    const completionTokens = data.usage?.completion_tokens ?? capResult.maxCompletionTokens;
+    await paidTierAccounting.settle(paidReservationId, {
+      promptTokens,
+      completionTokens,
+      actualCost: Number(data.metadata?.cost) || 0,
+      sessionId: session_id
     });
-
-
-
-    if (logError) {
-
-      // Log the error but don't fail the request — usage is already consumed
-
-      console.error(`[USAGE] Failed to log usage for user ${userId}:`, logError.message);
-
-    }
+    paidReservationId = null;
 
 
 
@@ -2221,6 +2308,13 @@ app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
 
     console.error(`[CHAT] Request failed for user ${userId} (${err.code || err.name}).`);
+
+    if (paidReservationId) {
+      await paidTierAccounting.markUncertain(paidReservationId).catch((accountingError) => {
+        console.error(`[PAID-TIER] Could not retain uncertain quota reservation (${accountingError.name}).`);
+      });
+      paidReservationId = null;
+    }
 
     if (err.name === 'TimeoutError' || err.code === 'ABORT_ERR') {
 
@@ -2324,11 +2418,14 @@ async function openAIChatCompletionsHandler(req, res) {
 
   let isFreeTierRequest = false;
 
+  let paidReservationId = null;
+
   try {
 
     // STEP 1: Cap & routing check — identical to /chat
 
-    const estimatedTokenCount = Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages));
+    const estimatedTokenCount = Math.max(1, estimateMessagesTokens(messages), Number(estimated_tokens) || 0);
+    const maxCompletionTokens = getMaxCompletionTokens(req.body);
 
     const capResult = await checkCapBeforeRoute(userId, {
 
@@ -2337,6 +2434,8 @@ async function openAIChatCompletionsHandler(req, res) {
       requestedModel: req.body.model || req.body.requestedModel || forceModelHeader,
 
       hasImages,
+
+      maxCompletionTokens,
 
       estimatedTokens: estimatedTokenCount
 
@@ -2542,7 +2641,7 @@ async function openAIChatCompletionsHandler(req, res) {
 
         temperature: req.body.temperature,
 
-        max_tokens: req.body.max_completion_tokens || req.body.max_tokens,
+        max_tokens: maxCompletionTokens,
 
         mockEndpoint: req.headers['x-albion-mock-provider-url'],
 
@@ -2725,8 +2824,29 @@ async function openAIChatCompletionsHandler(req, res) {
 
 
     // STEP 5b: Paid tier → DeepInfra Native Routing (or LiteLLM fallback)
+    let paidReservation;
+    try {
+      paidReservation = await reservePaidTierRequest(userId, capResult, targetModel);
+    } catch (err) {
+      console.error(`[ALIAS] Paid quota reservation failed (${err.name}).`);
+      return res.status(503).json({ error: 'Usage accounting is temporarily unavailable. Please try again shortly.' });
+    }
+    if (!paidReservation.allowed) {
+      return res.status(402).json({
+        error: 'Your plan token cap is exhausted. Please top up or upgrade to continue.',
+        cap_exceeded: true,
+        tier: capResult.tier,
+        code: paidReservation.status || 'paid_tier_quota_exceeded'
+      });
+    }
+    paidReservationId = paidReservation.requestId;
+
+    // STEP 5b: Paid tier → DeepInfra Native Routing (or LiteLLM fallback)
 
     if (!DEEPINFRA_API_KEY) {
+
+      await paidTierAccounting.release(paidReservationId);
+      paidReservationId = null;
 
       return res.status(503).json({ error: 'AI provider is not configured. Please contact support.' });
 
@@ -2754,9 +2874,7 @@ async function openAIChatCompletionsHandler(req, res) {
 
         ...(req.body.temperature != null ? { temperature: req.body.temperature } : {}),
 
-        ...(req.body.max_tokens != null ? { max_tokens: req.body.max_tokens } : {}),
-
-        ...(req.body.max_completion_tokens != null ? { max_tokens: req.body.max_completion_tokens } : {})
+        max_tokens: maxCompletionTokens
 
       };
 
@@ -2788,6 +2906,10 @@ async function openAIChatCompletionsHandler(req, res) {
 
         console.error(`[PAID-ROUTER] DeepInfra returned 402 (wallet top-up required) for user ${userId}. No fallback configured.`);
 
+        await paidTierAccounting.release(paidReservationId);
+
+        paidReservationId = null;
+
         return res.status(503).json({ error: 'AI provider is temporarily unavailable. Please try again shortly.' });
 
       }
@@ -2812,9 +2934,7 @@ async function openAIChatCompletionsHandler(req, res) {
 
         ...(req.body.temperature != null ? { temperature: req.body.temperature } : {}),
 
-        ...(req.body.max_tokens != null ? { max_tokens: req.body.max_tokens } : {}),
-
-        ...(req.body.max_completion_tokens != null ? { max_tokens: req.body.max_completion_tokens } : {}),
+        max_tokens: maxCompletionTokens,
 
         ...(req.body.reasoning_effort != null ? { reasoning_effort: req.body.reasoning_effort } : {}),
 
@@ -2857,6 +2977,11 @@ async function openAIChatCompletionsHandler(req, res) {
       console.warn(`[ALIAS] Provider returned HTTP ${providerResponse.status} for ${targetModel} (user ${userId}).`);
 
       if (providerResponse.status === 429) res.setHeader('Retry-After', providerResponse.headers.get('retry-after') || '2');
+      if (paidReservationId) {
+        if (providerResponse.status >= 500 || providerResponse.status === 408) await paidTierAccounting.markUncertain(paidReservationId);
+        else await paidTierAccounting.release(paidReservationId);
+        paidReservationId = null;
+      }
 
       return res.status(mapped.status).json({ error: mapped.message, retry_after: providerResponse.status === 429 ? 2 : undefined });
 
@@ -2882,30 +3007,27 @@ async function openAIChatCompletionsHandler(req, res) {
 
         res,
 
-        estimateMessagesTokens(orderedMessages),
+        capResult.promptEstimate,
 
-        async ({ promptTokens, completionTokens }) => {
-
-          const { error: logError } = await supabase.from('usage_logs').insert({
-
-            user_id: userId,
-
-            model: targetModel,
-
-            prompt_tokens: promptTokens,
-
-            completion_tokens: completionTokens,
-
-            actual_cost: 0,
-
-            session_id: session_id || null,
-
-            timestamp: new Date().toISOString()
-
-          });
-
-          if (logError) console.error(`[USAGE] Failed to log streamed usage for user ${userId}:`, logError.message);
-
+        async ({ promptTokens, completionTokens, usageReported, streamComplete }) => {
+          if (!paidReservationId) return;
+          try {
+            if (usageReported || streamComplete) {
+              await paidTierAccounting.settle(paidReservationId, {
+                promptTokens: usageReported ? promptTokens : capResult.promptEstimate,
+                completionTokens: usageReported ? completionTokens : capResult.maxCompletionTokens,
+                actualCost: 0,
+                sessionId: session_id
+              });
+            } else {
+              await paidTierAccounting.markUncertain(paidReservationId);
+            }
+            paidReservationId = null;
+          } catch (err) {
+            console.error(`[PAID-TIER] Stream settlement failed (${err.name}); retaining quota reservation.`);
+            await paidTierAccounting.markUncertain(paidReservationId).catch(() => {});
+            paidReservationId = null;
+          }
         }
 
       );
@@ -2922,29 +3044,14 @@ async function openAIChatCompletionsHandler(req, res) {
 
     // Log usage for paid models (same as /chat STEP 7)
 
-    const { error: logError } = await supabase.from('usage_logs').insert({
-
-      user_id: userId,
-
-      model: targetModel,
-
-      prompt_tokens: data.usage?.prompt_tokens || 0,
-
-      completion_tokens: data.usage?.completion_tokens || 0,
-
-      actual_cost: data.metadata?.cost || 0,
-
-      session_id: session_id || null,
-
-      timestamp: new Date().toISOString()
-
+    await paidTierAccounting.settle(paidReservationId, {
+      promptTokens: data.usage?.prompt_tokens ?? capResult.promptEstimate,
+      completionTokens: data.usage?.completion_tokens ?? capResult.maxCompletionTokens,
+      actualCost: Number(data.metadata?.cost) || 0,
+      sessionId: session_id
     });
+    paidReservationId = null;
 
-    if (logError) {
-
-      console.error(`[ALIAS] Failed to log usage for user ${userId}:`, logError.message);
-
-    }
 
 
 
@@ -2961,6 +3068,12 @@ async function openAIChatCompletionsHandler(req, res) {
     }
 
     console.error(`[ALIAS] Request failed for user ${userId} (${err.code || err.name}).`);
+    if (paidReservationId) {
+      await paidTierAccounting.markUncertain(paidReservationId).catch((accountingError) => {
+        console.error(`[PAID-TIER] Could not retain uncertain stream/request reservation (${accountingError.name}).`);
+      });
+      paidReservationId = null;
+    }
 
     if ((err.name === 'TimeoutError' || err.code === 'ABORT_ERR') && !res.headersSent) {
 
@@ -3160,8 +3273,6 @@ app.post('/billing/topup-check', authenticate, async (req, res) => {
 // Creates a NOWPayments hosted invoice for a given user + plan tier.
 // Called by the IDE frontend when user clicks "Pay with Crypto".
 // ---------------------------------------------------------------------------
-const TIER_PRICES_USD = { learner: 3, starter: 8, pro: 13 };
-
 app.post('/api/create-nowpayment-invoice', express.json(), async (req, res) => {
   const NOWPAYMENT_API_KEY = (process.env.NOWPAYMENT_API_KEY || '').trim();
   if (!NOWPAYMENT_API_KEY) {
@@ -3981,9 +4092,11 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
     const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
 
-    const currentTierCaps = mergeModelCaps(tierCaps[tier] || {}, subscription?.model_balances);
+    const currentTierCaps = mergeModelCaps(tierCaps[tier] || {}, subscription?.model_balances, MODELS_BY_TIER[tier]);
 
     const modelUsage = {};
+
+    let totalUsage = 0;
 
 
 
@@ -4015,6 +4128,22 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
 
 
+    totalUsage = Object.values(modelUsage).reduce((sum, used) => sum + used, 0);
+
+    const { data: pendingReservations, error: reservationError } = await supabase
+      .from('albion_paid_quota_reservations')
+      .select('model_id, reserved_tokens')
+      .eq('user_id', userId)
+      .eq('cycle_start', cycleStart)
+      .in('status', ['reserved', 'uncertain']);
+    if (reservationError) {
+      return res.status(503).json({ error: 'Paid-tier accounting is temporarily unavailable.' });
+    }
+    const modelReserved = {};
+    for (const reservation of pendingReservations || []) {
+      modelReserved[reservation.model_id] = (modelReserved[reservation.model_id] || 0) + Number(reservation.reserved_tokens || 0);
+    }
+    const totalReserved = Object.values(modelReserved).reduce((sum, reserved) => sum + reserved, 0);
     const trackedModels = Object.keys(currentTierCaps);
 
     const caps = {};
@@ -4031,6 +4160,8 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
         used,
 
+        reserved: modelReserved[m] || 0,
+
         limit: cap
 
       };
@@ -4039,7 +4170,9 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
 
 
-    const capExceeded =
+    const tierTotalCap = TIER_CONFIG[tier]?.totalTokens || 0;
+    const tierTotalRemaining = Math.max(0, tierTotalCap - totalUsage - totalReserved);
+    const capExceeded = totalUsage + totalReserved >= tierTotalCap ||
 
       trackedModels.length > 0 &&
 
@@ -4047,7 +4180,7 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
         const limit = caps[m].limit;
 
-        return limit >= 0 && caps[m].used >= limit;
+        return limit >= 0 && caps[m].used + caps[m].reserved >= limit;
 
       });
 
@@ -4060,6 +4193,18 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
       caps,
 
       models: caps,
+
+      total_tokens_used: totalUsage,
+
+      total_tokens_reserved: totalReserved,
+
+      total_tokens_cap: tierTotalCap,
+
+      total_tokens_remaining: tierTotalRemaining,
+
+      total_tokens_percent: tierTotalCap > 0 ? Math.min(100, Number(((totalUsage / tierTotalCap) * 100).toFixed(1))) : 0,
+
+      billing_cycle_start: cycleStart,
 
       lifetime_tokens: null,
 

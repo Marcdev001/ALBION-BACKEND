@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { MODEL_IDS, authorizeModel, canUseModel, getDeepInfraModelId, getModelAccessError, isKnownModel, mergeModelCaps } = require('../lib/modelCatalog');
+const { MODEL_IDS, MODEL_BALANCES_BY_TIER, MODEL_BALANCE_TOTALS_BY_TIER, authorizeModel, canUseModel, getDeepInfraModelId, getModelAccessError, isKnownModel, mergeModelCaps } = require('../lib/modelCatalog');
 
 test('catalog accepts the five exact DeepInfra IDs without changing case', () => {
 	const expected = [
@@ -27,9 +27,9 @@ test('Free, Starter, and Pro model authorization matrix is enforced', () => {
 	);
 	assert.deepEqual(
 		Object.values(MODEL_IDS).map((modelId) => canUseModel('starter', modelId)),
-		[true, true, true, false, false]
+		[false, true, true, false, false]
 	);
-	assert.deepEqual(Object.values(MODEL_IDS).map((modelId) => canUseModel('pro', modelId)), [true, true, true, true, true]);
+	assert.deepEqual(Object.values(MODEL_IDS).map((modelId) => canUseModel('pro', modelId)), [false, false, false, true, true]);
 });
 
 test('unknown and legacy aliases are rejected instead of being silently substituted', () => {
@@ -43,7 +43,7 @@ test('unknown and legacy aliases are rejected instead of being silently substitu
 });
 
 test('unauthorized exact model requests return a clear 403 decision', () => {
-	for (const tier of ['free', 'starter']) {
+	for (const tier of ['free', 'starter', 'pro']) {
 		for (const modelId of Object.values(MODEL_IDS)) {
 			if (canUseModel(tier, modelId)) continue;
 			const access = authorizeModel(tier, modelId);
@@ -57,12 +57,24 @@ test('unauthorized exact model requests return a clear 403 decision', () => {
 test('persisted exact-ID subscription balances override defaults without reviving aliases', () => {
 	const caps = mergeModelCaps(
 		{ [MODEL_IDS.FREE]: 100, [MODEL_IDS.STARTER_DEEPSEEK]: 200 },
-		{ [MODEL_IDS.STARTER_DEEPSEEK]: 50, 'deepseek-v4-flash': 900, [MODEL_IDS.STARTER_MIMO]: 0 }
+		{ [MODEL_IDS.FREE]: 900, [MODEL_IDS.STARTER_DEEPSEEK]: 50, 'deepseek-v4-flash': 900, [MODEL_IDS.STARTER_MIMO]: 0 },
+		[MODEL_IDS.STARTER_DEEPSEEK, MODEL_IDS.STARTER_MIMO]
 	);
 
 	assert.deepEqual(caps, {
-		[MODEL_IDS.FREE]: 100,
 		[MODEL_IDS.STARTER_DEEPSEEK]: 50,
 		[MODEL_IDS.STARTER_MIMO]: 0
 	});
+});
+
+test('Starter and Pro allocations match production values exactly', () => {
+	assert.deepEqual(MODEL_BALANCES_BY_TIER.starter, {
+		[MODEL_IDS.STARTER_DEEPSEEK]: 4_000_000,
+		[MODEL_IDS.STARTER_MIMO]: 3_000_000
+	});
+	assert.deepEqual(MODEL_BALANCES_BY_TIER.pro, {
+		[MODEL_IDS.PRO_DEEPSEEK]: 3_000_000,
+		[MODEL_IDS.PRO_MIMO]: 5_000_000
+	});
+	assert.deepEqual(MODEL_BALANCE_TOTALS_BY_TIER, { starter: 7_000_000, pro: 8_000_000 });
 });
