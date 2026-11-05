@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "build": "node --check server.js",
+    "test": "node --test test/*.test.js",
+    "test:staging": "node scripts/staging-smoke-test.js"
   },
   "keywords": [],
   "author": "",

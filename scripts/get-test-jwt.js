@@ -48,7 +48,7 @@ async function getTestToken() {
   console.log('\n--- END TOKEN ---\n');
   console.log('Token expires at:', new Date(data.session.expires_at * 1000).toISOString());
   console.log('\nTest curl command:');
-  console.log(`curl -X POST http://localhost:3000/chat -H "Content-Type: application/json" -H "Authorization: Bearer ${data.session.access_token}" -d "{\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"Hello from Albion\\"}],\\"model_preference\\":\\"deepseek-v4-flash\\",\\"estimated_tokens\\":500,\\"session_id\\":\\"test-session-1\\"}"`);
+  console.log(`curl -X POST http://localhost:3000/chat -H "Content-Type: application/json" -H "Authorization: Bearer ${data.session.access_token}" -d "{\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"Hello from Albion\\"}],\\"model_preference\\":\\"deepseek-ai/DeepSeek-V4-Flash\\",\\"estimated_tokens\\":500,\\"session_id\\":\\"test-session-1\\"}"`);
 }
 
 getTestToken();

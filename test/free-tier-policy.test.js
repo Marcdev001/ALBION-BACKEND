@@ -17,7 +17,7 @@ const {
 
 test('free tier default cap is a 100k lifetime allowance', () => {
 	assert.equal(DEFAULT_FREE_TIER_TOKEN_CAP, 100000);
-	assert.equal(FREE_TIER_MODEL_ID, 'qwen/qwen3-coder-30b-a3b-instruct');
+	assert.equal(FREE_TIER_MODEL_ID, 'deepseek-ai/DeepSeek-V4-Flash');
 });
 
 test('99k used + 2k estimated is blocked with 402', () => {

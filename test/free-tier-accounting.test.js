@@ -95,3 +95,11 @@ test('read errors are surfaced so callers can return 503', async () => {
 	const accounting = createFreeTierAccounting(supabase);
 	await assert.rejects(() => accounting.getUsage('user-1'), /relation missing/);
 });
+
+test('usage logs default to the exact Free catalog model ID', async () => {
+	const supabase = fakeSupabase();
+	const accounting = createFreeTierAccounting(supabase);
+	await accounting.recordUsageLog('user-1', { promptTokens: 2, completionTokens: 1 });
+	const insert = supabase.calls.find((call) => call.type === 'insert');
+	assert.equal(insert.row.model, 'deepseek-ai/DeepSeek-V4-Flash');
+});

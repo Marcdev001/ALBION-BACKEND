@@ -2,26 +2,24 @@
 # Phase 1: Backend Proxy Core - End-to-End Verification
 
 This guide verifies the complete proxy pipeline:
-**Auth → Cap Check → LiteLLM Routing → Supabase Logging**
+**Auth → Server-side Tier/Cap Check → DeepInfra → Supabase Usage Logging**
 
 ---
 
 ## Prerequisites
 
-- Node.js installed (v16+)
-- Python 3.8+ installed (for LiteLLM)
+- Node.js installed (v18+)
 - A Supabase project with:
   - `subscriptions` table (columns: `user_id`, `tier`, `cycle_start`, `status`)
   - `usage_logs` table (columns: `user_id`, `model`, `prompt_tokens`, `completion_tokens`, `actual_cost`, `session_id`, `timestamp`)
   - An RPC function `get_current_cycle_usage(p_user_id, p_cycle_start)` returning total tokens used
 - A DeepInfra account with API key
-- A Together AI account with API key (for failover testing)
 
 ---
 
 ## A. Infrastructure Startup
 
-Open **three** separate terminal windows.
+Open **two** separate terminal windows.
 
 ### Terminal 1: Configure Environment
 ```powershell
@@ -37,22 +35,10 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...your-service-role-key
 PORT=3000
 ALLOWED_ORIGINS=*
-LITELLM_BASE_URL=http://localhost:4000
-LITELLM_MASTER_KEY=sk-albion-proxy-key-CHANGE-ME-IN-PROD
 DEEPINFRA_API_KEY=your-deepinfra-api-key
-TOGETHER_API_KEY=your-together-api-key
-DATABASE_URL=postgresql://user:pass@host:5432/litellm_db
 ```
 
-### Terminal 2: Start LiteLLM Proxy
-```powershell
-cd albion-proxy
-pip install "litellm[proxy]"
-litellm --config litellm_config.yaml --port 4000
-```
-**Expected output:** `LiteLLM Proxy running on port 4000`
-
-### Terminal 3: Start Albion Proxy
+### Terminal 2: Start Albion Proxy
 ```powershell
 cd albion-proxy
 node server.js
@@ -60,7 +46,6 @@ node server.js
 **Expected output:**
 ```
 Albion Proxy running on port 3000
-LiteLLM target: http://localhost:4000
 CORS origins: *
 ```
 
@@ -160,8 +145,8 @@ Replace `<YOUR_JWT>` with the real token from Step 1:
 ```powershell
 curl -X POST http://localhost:3000/chat `
   -H "Content-Type: application/json" `
-  -H "Authorization: Bearer <YOUR_JWT>" `
-  -d "{`"messages`":[{`"role`":`"user`",`"content`":`"Hello from Albion. Reply with exactly: Albion proxy working.`"}],`"model_preference`":`"deepseek-v4-flash`",`"estimated_tokens`":500,`"session_id`":`"test-session-1`"}"
+   -H "Authorization: Bearer <YOUR_JWT>" `
+   -d "{`"messages`":[{`"role`":`"user`",`"content`":`"Hello from Albion. Reply with exactly: Albion proxy working.`"}],`"model_preference`":`"deepseek-ai/DeepSeek-V4-Flash`",`"estimated_tokens`":500,`"session_id`":`"test-session-1`"}"
 ```
 
 **Expected curl response (success):**
@@ -191,41 +176,24 @@ curl -X POST http://localhost:3000/chat `
 [No errors — clean pass through authenticate() and checkCapBeforeRoute()]
 ```
 
-**Expected curl response (if LiteLLM is down):**
+**Expected curl response (if DeepInfra is unavailable):**
 ```json
 {"error":"Provider unavailable. Retrying...","retry_after":2000}
 ```
 
 ---
 
-## F. Test 5: Cap Enforcement
-
-### Setup: Max out the test user's usage
-In Supabase SQL Editor, insert fake usage to exceed the starter cap (5M tokens):
-```sql
-INSERT INTO usage_logs (user_id, model, prompt_tokens, completion_tokens, actual_cost, session_id, timestamp)
-VALUES ('<USER_ID>', 'deepseek-v4-flash', 4999000, 0, 0, 'cap-test', NOW());
-```
+## F. Test 5: Server-side Model Authorization
 
 ### Run the test
 ```powershell
 curl -X POST http://localhost:3000/chat `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer <YOUR_JWT>" `
-  -d "{`"messages`":[{`"role`":`"user`",`"content`":`"test cap enforcement`"}],`"model_preference`":`"deepseek-v4-pro`",`"estimated_tokens`":5000,`"session_id`":`"cap-test-2`"}"
+  -d "{`"messages`":[{`"role`":`"user`",`"content`":`"test model authorization`"}],`"model_preference`":`"deepseek-ai/DeepSeek-V4-Pro-0813`",`"estimated_tokens`":5000,`"session_id`":`"cap-test-2`"}"
 ```
 
-**Expected server.js console:**
-```
-[CAP] User <USER_ID> (starter) would exceed cap: 4999000 + 5000 > 5000000. Forcing flash_only.
-```
-
-**Expected behavior:** Even though the user requested `deepseek-v4-pro`, the proxy silently downgrades to `deepseek-v4-flash` because `4999000 + 5000 > 5000000`.
-
-### Cleanup
-```sql
-DELETE FROM usage_logs WHERE session_id = 'cap-test';
-```
+**Expected behavior:** Starter does not have Pro-model access. The exact Pro model request is rejected with HTTP 403 and `code: "model_access_denied"`; the proxy never silently substitutes another model.
 
 ---
 
@@ -236,7 +204,7 @@ After running Test 4 (full end-to-end), verify usage was logged:
 1. Go to Supabase Dashboard → **Table Editor** → `usage_logs`
 2. You should see a new row with:
    - `user_id`: matches your test user
-   - `model`: `deepseek-v4-flash`
+  - `model`: `deepseek-ai/DeepSeek-V4-Flash`
    - `prompt_tokens`: matches the response's `usage.prompt_tokens`
    - `completion_tokens`: matches the response's `usage.completion_tokens`
    - `session_id`: `test-session-1`

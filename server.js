@@ -52,7 +52,6 @@ const {
 
 	FREE_TIER_MODEL_ID,
 
-	DEFAULT_DEEPINFRA_FLASH_MODEL,
 
 	getFreeTierTokenCap,
 
@@ -71,6 +70,11 @@ const {
 } = require('./lib/freeTierPolicy');
 
 const { createFreeTierAccounting } = require('./lib/freeTierAccounting');
+
+const { MODEL_IDS, MODELS_BY_TIER, getDeepInfraModelId, authorizeModel, mergeModelCaps, getModelAccessError } = require('./lib/modelCatalog');
+const { mapProviderStatus } = require('./lib/providerErrors');
+const { verifyNowPaymentsSignature, matchesRegisteredInvoice, normalizePayCurrency, isSupportedPayCurrency } = require('./lib/nowpayments');
+const { buildDeepInfraRequestBody } = require('./lib/deepinfraRequest');
 
 
 
@@ -284,8 +288,6 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || process.env.PAYST
 
 // rate limits, so a long-running user is never interrupted mid-session.
 
-const FREE_TIER_PROVIDER = (process.env.FREE_TIER_PROVIDER || '').trim().toLowerCase();
-
 const FREE_TIER_TOKEN_CAP = getFreeTierTokenCap();
 
 
@@ -296,17 +298,6 @@ const DEEPINFRA_API_KEY = (process.env.DEEPINFRA_API_KEY || '').trim();
 
 const DEEPINFRA_ENDPOINT = process.env.DEEPINFRA_ENDPOINT || 'https://api.deepinfra.com/v1/openai/chat/completions';
 
-const DEEPINFRA_MODEL_MAP = {
-
-  'deepseek-v4-flash': process.env.DEEPINFRA_FLASH_MODEL || DEFAULT_DEEPINFRA_FLASH_MODEL,
-
-  'deepseek-v4-pro': process.env.DEEPINFRA_PRO_MODEL || 'deepseek-ai/DeepSeek-R1',
-
-  'qwen3.6-35b-a3b': process.env.DEEPINFRA_QWEN_MODEL || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-
-  'glm-5.2': process.env.DEEPINFRA_GLM_MODEL || 'deepseek-ai/DeepSeek-V3'
-
-};
 
 
 
@@ -371,9 +362,9 @@ const TIER_CONFIG = {
     priceUsd: 0,
     totalTokens: 100000,
     isLifetime: true,
-    allowedModels: ['qwen/qwen3-coder-30b-a3b-instruct'],
+    allowedModels: [MODEL_IDS.FREE],
     modelBalances: {
-      'qwen/qwen3-coder-30b-a3b-instruct': 100000
+      [MODEL_IDS.FREE]: 100000
     }
   },
   learner: {
@@ -381,9 +372,10 @@ const TIER_CONFIG = {
     priceUsd: 3.00,
     totalTokens: 2000000,
     isLifetime: false,
-    allowedModels: ['deepseek/deepseek-v4.1-flash-1017'],
+    allowedModels: MODELS_BY_TIER.learner,
     modelBalances: {
-      'deepseek/deepseek-v4.1-flash-1017': 2000000
+      [MODEL_IDS.FREE]: 1000000,
+      [MODEL_IDS.STARTER_DEEPSEEK]: 1000000
     }
   },
   starter: {
@@ -391,13 +383,11 @@ const TIER_CONFIG = {
     priceUsd: 8.00,
     totalTokens: 8000000,
     isLifetime: false,
-    allowedModels: [
-      'deepseek/deepseek-v4.1-flash-1017',
-      'xiaomi/mimo-v2.6-flash'
-    ],
+    allowedModels: MODELS_BY_TIER.starter,
     modelBalances: {
-      'deepseek/deepseek-v4.1-flash-1017': 4000000,
-      'xiaomi/mimo-v2.6-flash': 4000000
+      [MODEL_IDS.FREE]: 2666667,
+      [MODEL_IDS.STARTER_DEEPSEEK]: 2666667,
+      [MODEL_IDS.STARTER_MIMO]: 2666666
     }
   },
   pro: {
@@ -405,16 +395,13 @@ const TIER_CONFIG = {
     priceUsd: 13.00,
     totalTokens: 12000000,
     isLifetime: false,
-    allowedModels: [
-      'deepseek/deepseek-v4.5-instruct',
-      'xai/grok-4.1-fast',
-      'xiaomi/mimo-v2.6-flash',
-      'deepseek/deepseek-v4.1-flash-1017'
-    ],
+    allowedModels: MODELS_BY_TIER.pro,
     modelBalances: {
-      'deepseek/deepseek-v4.5-instruct': 4000000,
-      'xai/grok-4.1-fast': 4000000,
-      'xiaomi/mimo-v2.6-flash': 4000000
+      [MODEL_IDS.FREE]: 2400000,
+      [MODEL_IDS.STARTER_DEEPSEEK]: 2400000,
+      [MODEL_IDS.STARTER_MIMO]: 2400000,
+      [MODEL_IDS.PRO_DEEPSEEK]: 2400000,
+      [MODEL_IDS.PRO_MIMO]: 2400000
     }
   }
 };
@@ -426,25 +413,29 @@ const tierCaps = {
   },
 
   learner: {
-    'deepseek/deepseek-v4.1-flash-1017': 2000000
+    [MODEL_IDS.FREE]: 1000000,
+    [MODEL_IDS.STARTER_DEEPSEEK]: 1000000
   },
 
   starter: {
-    'deepseek/deepseek-v4.1-flash-1017': 4000000,
-    'xiaomi/mimo-v2.6-flash': 4000000
+    [MODEL_IDS.FREE]: 2666667,
+    [MODEL_IDS.STARTER_DEEPSEEK]: 2666667,
+    [MODEL_IDS.STARTER_MIMO]: 2666666
   },
 
   pro: {
-    'deepseek/deepseek-v4.5-instruct': 4000000,
-    'xai/grok-4.1-fast': 4000000,
-    'xiaomi/mimo-v2.6-flash': 4000000
+    [MODEL_IDS.FREE]: 2400000,
+    [MODEL_IDS.STARTER_DEEPSEEK]: 2400000,
+    [MODEL_IDS.STARTER_MIMO]: 2400000,
+    [MODEL_IDS.PRO_DEEPSEEK]: 2400000,
+    [MODEL_IDS.PRO_MIMO]: 2400000
   }
 
 };
 
 
 
-const PREMIUM_TOGGLE_MODELS = new Set(['deepseek-v4-pro', 'glm-5.2']);
+const PREMIUM_TOGGLE_MODELS = new Set([MODEL_IDS.PRO_DEEPSEEK, MODEL_IDS.PRO_MIMO]);
 
 // Retained for backwards compatibility with older imports/tests. Routing uses
 
@@ -604,7 +595,7 @@ async function authenticate(req, res, next) {
 
     const payload = decodeJwtPayload(token);
 
-    if (payload && payload.sub) {
+    if (payload && payload.sub && process.env.NODE_ENV !== 'production') {
 
       const { data: adminData, error: adminErr } = await supabase.auth.admin.getUserById(payload.sub);
 
@@ -624,7 +615,7 @@ async function authenticate(req, res, next) {
 
     // 3. Fallback for placeholder token in development
 
-    if (token === 'albion-token-placeholder' || token === 'albion-token') {
+    if (process.env.NODE_ENV !== 'production' && (token === 'albion-token-placeholder' || token === 'albion-token')) {
 
       req.user = { id: 'bcf623e6-8760-43b9-905c-015f00f45537', email: 'user@albion.dev' };
 
@@ -634,7 +625,7 @@ async function authenticate(req, res, next) {
 
 
 
-    console.warn(`[AUTH] Authentication failed for token: ${token.substring(0, 10)}... Error: ${error?.message || 'User not found'}`);
+    console.warn(`[AUTH] Authentication failed: ${error?.message || 'User not found'}`);
 
     return res.status(401).json({ error: 'Invalid token' });
 
@@ -662,7 +653,7 @@ async function authenticate(req, res, next) {
 
 // ---------------------------------------------------------------------------
 
-async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = false, estimatedTokens = 1000 } = {}) {
+async function checkCapBeforeRoute(userId, { forceModel = null, requestedModel = null, hasImages = false, estimatedTokens = 1000 } = {}) {
 
   // 1. Get user's active subscription
 
@@ -670,7 +661,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
   try {
 
-    const { data: subData } = await supabase
+    const { data: subData, error: subError } = await supabase
 
       .from('subscriptions')
 
@@ -681,12 +672,15 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
       .eq('status', 'active')
 
       .maybeSingle();
+    if (subError) throw subError;
 
     subscription = subData;
 
   } catch (err) {
 
     console.warn(`[CAP] Error querying subscription for user ${userId}:`, err.message);
+
+    return { tier: 'unknown', targetModel: null, accountingError: true, error: 'Unable to verify your subscription. Please try again shortly.' };
 
   }
 
@@ -697,6 +691,24 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
   if (subscription && subscription.tier && tierCaps[subscription.tier]) {
 
     tier = subscription.tier;
+
+  }
+
+  const selectedRequestModel = requestedModel || forceModel;
+
+  const modelAccess = selectedRequestModel ? authorizeModel(tier, selectedRequestModel) : { ok: true };
+  if (!modelAccess.ok) {
+    return {
+
+      tier,
+
+      targetModel: selectedRequestModel,
+
+      modelAccessDenied: true,
+
+      modelAccessError: modelAccess.error
+
+    };
 
   }
 
@@ -860,7 +872,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
   // 2. Fetch usage grouped by model for current cycle
 
-  const currentTierCaps = tierCaps[tier] || tierCaps.learner;
+  const currentTierCaps = mergeModelCaps(tierCaps[tier] || tierCaps.learner, subscription?.model_balances);
 
   const modelUsage = {};
 
@@ -880,7 +892,9 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
 
 
-    if (!logsError && Array.isArray(logs)) {
+    if (logsError) throw logsError;
+
+    if (Array.isArray(logs)) {
 
       for (const log of logs) {
 
@@ -898,6 +912,8 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
     console.warn(`[CAP] Error fetching per-model usage for user ${userId}:`, err.message);
 
+    return { tier, targetModel: selectedRequestModel, accountingError: true, error: 'Usage accounting is temporarily unavailable. Please try again shortly.' };
+
   }
 
 
@@ -910,9 +926,11 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
   let maxUtilization = 0;
 
-  let flashUsed = 0;
+  const primaryModel = selectedRequestModel || MODEL_IDS.FREE;
 
-  let flashCap = currentTierCaps['deepseek-v4-flash'] || 1;
+  let flashUsed = modelUsage[primaryModel] || 0;
+
+  let flashCap = currentTierCaps[primaryModel] || 1;
 
 
 
@@ -930,7 +948,7 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
 
 
-    if (m === 'deepseek-v4-flash') {
+    if (m === primaryModel) {
 
       flashUsed = used;
 
@@ -996,13 +1014,51 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
   let selectedModel = null;
 
+  if (selectedRequestModel) {
+
+    const requestedCap = currentTierCaps[selectedRequestModel];
+
+    const requestedUsed = modelUsage[selectedRequestModel] || 0;
+
+    if (!requestedCap || requestedUsed + estimatedTokens > requestedCap) {
+
+      return {
+
+        tier,
+
+        targetModel: selectedRequestModel,
+
+        modelCapExceeded: true,
+
+        isFreeTier: false,
+
+        warning: 'model_cap_exhausted',
+
+        usagePercent: Number(((requestedUsed / (requestedCap || 1)) * 100).toFixed(1)),
+
+        currentUsage: requestedUsed,
+
+        tierCap: requestedCap || 0,
+
+        maxUtilization,
+
+        capsSummary
+
+      };
+
+    }
+
+    selectedModel = selectedRequestModel;
+
+  }
+
 
 
   // Premium Toggle routing:
 
   // If client sends X-Albion-Force-Model (deepseek-v4-pro or glm-5.2) AND cap remains
 
-  if (forceModel && PREMIUM_TOGGLE_MODELS.has(forceModel)) {
+  if (!selectedModel && forceModel && PREMIUM_TOGGLE_MODELS.has(forceModel)) {
 
     const proCap = currentTierCaps[forceModel];
 
@@ -1028,15 +1084,15 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
   if (!selectedModel) {
 
-    if (hasImages && currentTierCaps['qwen3.6-35b-a3b']) {
+    if (hasImages && currentTierCaps[MODEL_IDS.STARTER_MIMO]) {
 
-      const qwenCap = currentTierCaps['qwen3.6-35b-a3b'];
+      const qwenCap = currentTierCaps[MODEL_IDS.STARTER_MIMO];
 
-      const qwenUsed = modelUsage['qwen3.6-35b-a3b'] || 0;
+      const qwenUsed = modelUsage[MODEL_IDS.STARTER_MIMO] || 0;
 
       if (qwenUsed + estimatedTokens <= qwenCap) {
 
-        selectedModel = 'qwen3.6-35b-a3b';
+        selectedModel = MODEL_IDS.STARTER_MIMO;
 
       }
 
@@ -1048,9 +1104,9 @@ async function checkCapBeforeRoute(userId, { forceModel = null, hasImages = fals
 
     if (!selectedModel) {
 
-      if (currentTierCaps['deepseek-v4-flash'] && (flashUsed + estimatedTokens <= flashCap)) {
+      if (currentTierCaps[MODEL_IDS.FREE] && (modelUsage[MODEL_IDS.FREE] + estimatedTokens <= currentTierCaps[MODEL_IDS.FREE])) {
 
-        selectedModel = 'deepseek-v4-flash';
+        selectedModel = MODEL_IDS.FREE;
 
       } else {
 
@@ -1130,7 +1186,7 @@ function resolveFreeTierProvider(metadata = {}) {
 
   // Support mock endpoint for tests
 
-  if (metadata.mockEndpoint) {
+  if (metadata.mockEndpoint && process.env.NODE_ENV !== 'production') {
 
     const apiKey = metadata.apiKey || DEEPINFRA_API_KEY;
 
@@ -1144,7 +1200,7 @@ function resolveFreeTierProvider(metadata = {}) {
 
       apiKey,
 
-      model: metadata.model || DEEPINFRA_MODEL_MAP[FREE_TIER_MODEL_ID]
+      model: metadata.model || getDeepInfraModelId(FREE_TIER_MODEL_ID)
 
     };
 
@@ -1162,7 +1218,7 @@ function resolveFreeTierProvider(metadata = {}) {
 
       apiKey: metadata.apiKey || DEEPINFRA_API_KEY,
 
-      model: metadata.model || DEEPINFRA_MODEL_MAP[FREE_TIER_MODEL_ID]
+      model: metadata.model || getDeepInfraModelId(FREE_TIER_MODEL_ID)
 
     };
 
@@ -1222,13 +1278,13 @@ function freeTierProviderHeaders(provider) {
 
 
 
-function freeTierUnavailable(provider) {
+function freeTierUnavailable(provider, status = 503) {
 
   return {
 
     success: false,
 
-    status: 503,
+    status,
 
     provider: provider ? provider.provider : null,
 
@@ -1268,6 +1324,8 @@ async function dispatchFreeTierChat(messages, metadata = {}) {
 
       headers: freeTierProviderHeaders(provider),
 
+      signal: AbortSignal.timeout(60000),
+
       body: JSON.stringify(buildFreeTierRequestBody(messages, metadata, provider, false))
 
     });
@@ -1280,11 +1338,11 @@ async function dispatchFreeTierChat(messages, metadata = {}) {
 
       console.error(
 
-        `[FREE-TIER] ${provider.provider} returned HTTP ${response.status}: ${errText}. No fallback configured.`
+        `[FREE-TIER] ${provider.provider} returned HTTP ${response.status}.`
 
       );
 
-      return freeTierUnavailable(provider);
+      return freeTierUnavailable(provider, mapProviderStatus(response.status).status);
 
     }
 
@@ -1296,9 +1354,9 @@ async function dispatchFreeTierChat(messages, metadata = {}) {
 
   } catch (err) {
 
-    console.error(`[FREE-TIER] ${provider.provider} request failed: ${err.message}. No fallback configured.`);
+    console.error(`[FREE-TIER] ${provider.provider} request failed (${err.code || err.name}).`);
 
-    return freeTierUnavailable(provider);
+    return freeTierUnavailable(provider, err.name === 'TimeoutError' ? 504 : 503);
 
   }
 
@@ -1330,6 +1388,8 @@ async function dispatchFreeTierStream(messages, metadata = {}) {
 
       headers: freeTierProviderHeaders(provider),
 
+      signal: AbortSignal.timeout(60000),
+
       body: JSON.stringify(buildFreeTierRequestBody(messages, metadata, provider, true))
 
     });
@@ -1342,11 +1402,11 @@ async function dispatchFreeTierStream(messages, metadata = {}) {
 
       console.error(
 
-        `[FREE-TIER] ${provider.provider} stream returned HTTP ${response.status}: ${errText}. No fallback configured.`
+        `[FREE-TIER] ${provider.provider} stream returned HTTP ${response.status}.`
 
       );
 
-      return freeTierUnavailable(provider);
+      return freeTierUnavailable(provider, mapProviderStatus(response.status).status);
 
     }
 
@@ -1356,9 +1416,9 @@ async function dispatchFreeTierStream(messages, metadata = {}) {
 
   } catch (err) {
 
-    console.error(`[FREE-TIER] ${provider.provider} stream failed: ${err.message}. No fallback configured.`);
+    console.error(`[FREE-TIER] ${provider.provider} stream failed (${err.code || err.name}).`);
 
-    return freeTierUnavailable(provider);
+    return freeTierUnavailable(provider, err.name === 'TimeoutError' ? 504 : 503);
 
   }
 
@@ -1600,7 +1660,7 @@ async function recordFreeTierUsage(userId, { promptTokens, completionTokens, res
 
 // ---------------------------------------------------------------------------
 
-app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
+app.post('/chat', authenticate, globalRateLimiter, async (req, res) => {
 
   const userId = req.user.id;
 
@@ -1652,11 +1712,19 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
       forceModel: forceModelHeader,
 
+      requestedModel: model_preference || req.body.requestedModel || req.body.model || forceModelHeader,
+
       hasImages,
 
       estimatedTokens: estimatedTokenCount
 
     });
+
+    if (capResult.modelAccessDenied) {
+
+      return res.status(403).json({ error: capResult.modelAccessError, code: 'model_access_denied' });
+
+    }
 
     isFreeTierRequest = Boolean(capResult.isFreeTier);
 
@@ -1782,7 +1850,7 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
       return res.status(503).json({
 
-        error: capResult.error || 'Free tier accounting is temporarily unavailable.',
+        error: capResult.error || 'Usage accounting is temporarily unavailable. Please try again shortly.',
 
         accounting_error: true
 
@@ -1876,6 +1944,8 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
         userId,
 
+        model: targetModel,
+
         project_path,
 
         temperature: req.body.temperature,
@@ -1896,7 +1966,9 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
         await freeTierAccounting.release(userId, reservation.reserved);
 
-        return res.status(503).json({
+        if (freeResult.status === 429) res.setHeader('Retry-After', '2');
+
+        return res.status(freeResult.status || 503).json({
 
           error: freeResult.error,
 
@@ -1956,7 +2028,7 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
     // Paid tier: caps exhausted -> 402. Never downgrade to a free provider.
 
-    if (capResult.allCapsExhausted || !targetModel) {
+    if (capResult.allCapsExhausted || capResult.modelCapExceeded || !targetModel) {
 
       return res.status(402).json({
 
@@ -1974,9 +2046,15 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
     // Paid Cloud Routing: Primary via DeepInfra Native OpenAI-compatible API
 
+    if (!DEEPINFRA_API_KEY) {
+
+      return res.status(503).json({ error: 'AI provider is not configured. Please contact support.' });
+
+    }
+
     let providerResponse;
 
-    const deepinfraModel = DEEPINFRA_MODEL_MAP[targetModel] || targetModel;
+    const deepinfraModel = getDeepInfraModelId(targetModel);
 
 
 
@@ -1985,6 +2063,8 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
       providerResponse = await fetch(DEEPINFRA_ENDPOINT, {
 
         method: 'POST',
+
+        signal: AbortSignal.timeout(60000),
 
         headers: {
 
@@ -1996,7 +2076,7 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
         body: JSON.stringify({
 
-          model: deepinfraModel,
+          model: buildDeepInfraRequestBody({ modelId: targetModel, messages: orderedMessages, temperature: 0.2 }).model,
 
           messages: orderedMessages,
 
@@ -2068,13 +2148,15 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
     if (!providerResponse.ok) {
 
-      const errorText = await providerResponse.text().catch(() => 'Unknown provider error');
+      await providerResponse.text().catch(() => '');
 
-      console.error(`[CHAT] Provider returned ${providerResponse.status} for model ${targetModel} (user ${userId}): ${errorText}`);
+      const mapped = mapProviderStatus(providerResponse.status);
 
+      console.warn(`[CHAT] Provider returned HTTP ${providerResponse.status} for model ${targetModel} (user ${userId}).`);
 
+      if (providerResponse.status === 429) res.setHeader('Retry-After', providerResponse.headers.get('retry-after') || '2');
 
-      throw new Error(`Provider returned HTTP ${providerResponse.status}`);
+      return res.status(mapped.status).json({ error: mapped.message, retry_after: providerResponse.status === 429 ? 2 : undefined });
 
     }
 
@@ -2138,7 +2220,13 @@ app.post('/chat', globalRateLimiter, authenticate, async (req, res) => {
 
 
 
-    console.error(`[CHAT] Error for user ${userId}:`, err.message);
+    console.error(`[CHAT] Request failed for user ${userId} (${err.code || err.name}).`);
+
+    if (err.name === 'TimeoutError' || err.code === 'ABORT_ERR') {
+
+      return res.status(504).json({ error: 'AI provider timed out. Please retry shortly.' });
+
+    }
 
 
 
@@ -2246,11 +2334,19 @@ async function openAIChatCompletionsHandler(req, res) {
 
       forceModel: forceModelHeader,
 
+      requestedModel: req.body.model || req.body.requestedModel || forceModelHeader,
+
       hasImages,
 
       estimatedTokens: estimatedTokenCount
 
     });
+
+    if (capResult.modelAccessDenied) {
+
+      return res.status(403).json({ error: capResult.modelAccessError, code: 'model_access_denied' });
+
+    }
 
     targetModel = capResult.targetModel;
 
@@ -2344,7 +2440,7 @@ async function openAIChatCompletionsHandler(req, res) {
 
       return res.status(503).json({
 
-        error: capResult.error || 'Free tier accounting is temporarily unavailable.',
+        error: capResult.error || 'Usage accounting is temporarily unavailable. Please try again shortly.',
 
         accounting_error: true
 
@@ -2436,6 +2532,8 @@ async function openAIChatCompletionsHandler(req, res) {
 
         userId,
 
+        model: targetModel,
+
         project_path,
 
         tools: req.body.tools,
@@ -2464,7 +2562,9 @@ async function openAIChatCompletionsHandler(req, res) {
 
           await freeTierAccounting.release(userId, reservation.reserved);
 
-          return res.status(503).json({
+          if (streamResult.status === 429) res.setHeader('Retry-After', '2');
+
+          return res.status(streamResult.status || 503).json({
 
             error: streamResult.error,
 
@@ -2546,7 +2646,9 @@ async function openAIChatCompletionsHandler(req, res) {
 
         await freeTierAccounting.release(userId, reservation.reserved);
 
-        return res.status(503).json({
+        if (freeResult.status === 429) res.setHeader('Retry-After', '2');
+
+        return res.status(freeResult.status || 503).json({
 
           error: freeResult.error,
 
@@ -2606,7 +2708,7 @@ async function openAIChatCompletionsHandler(req, res) {
 
     // Paid tier: caps exhausted -> 402. Never downgrade to a free provider.
 
-    if (capResult.allCapsExhausted || !targetModel) {
+    if (capResult.allCapsExhausted || capResult.modelCapExceeded || !targetModel) {
 
       return res.status(402).json({
 
@@ -2624,7 +2726,13 @@ async function openAIChatCompletionsHandler(req, res) {
 
     // STEP 5b: Paid tier → DeepInfra Native Routing (or LiteLLM fallback)
 
-    const deepinfraModel = DEEPINFRA_MODEL_MAP[targetModel] || targetModel;
+    if (!DEEPINFRA_API_KEY) {
+
+      return res.status(503).json({ error: 'AI provider is not configured. Please contact support.' });
+
+    }
+
+    const deepinfraModel = getDeepInfraModelId(targetModel);
 
     let providerResponse;
 
@@ -2634,11 +2742,11 @@ async function openAIChatCompletionsHandler(req, res) {
 
       const passBody = {
 
-        model: deepinfraModel,
+        model: buildDeepInfraRequestBody({ modelId: targetModel, messages: orderedMessages, stream, body: req.body }).model,
 
         messages: orderedMessages,
 
-        ...(stream ? { stream: true } : {}),
+        ...(stream ? { stream: true, stream_options: req.body.stream_options || { include_usage: true } } : {}),
 
         ...(req.body.tools ? { tools: req.body.tools } : {}),
 
@@ -2657,6 +2765,8 @@ async function openAIChatCompletionsHandler(req, res) {
       providerResponse = await fetch(DEEPINFRA_ENDPOINT, {
 
         method: 'POST',
+
+        signal: AbortSignal.timeout(60000),
 
         headers: {
 
@@ -2740,11 +2850,15 @@ async function openAIChatCompletionsHandler(req, res) {
 
     if (!providerResponse.ok) {
 
-      const errorText = await providerResponse.text().catch(() => 'Unknown provider error');
+      await providerResponse.text().catch(() => '');
 
-      console.error(`[ALIAS] Provider ${providerResponse.status} for ${targetModel} (user ${userId}): ${errorText}`);
+      const mapped = mapProviderStatus(providerResponse.status);
 
-      throw new Error(`Provider returned HTTP ${providerResponse.status}`);
+      console.warn(`[ALIAS] Provider returned HTTP ${providerResponse.status} for ${targetModel} (user ${userId}).`);
+
+      if (providerResponse.status === 429) res.setHeader('Retry-After', providerResponse.headers.get('retry-after') || '2');
+
+      return res.status(mapped.status).json({ error: mapped.message, retry_after: providerResponse.status === 429 ? 2 : undefined });
 
     }
 
@@ -2762,7 +2876,39 @@ async function openAIChatCompletionsHandler(req, res) {
 
       res.setHeader('X-Accel-Buffering', 'no');
 
-      pipeResponseBody(providerResponse, res);
+      await pipeSseWithUsage(
+
+        providerResponse,
+
+        res,
+
+        estimateMessagesTokens(orderedMessages),
+
+        async ({ promptTokens, completionTokens }) => {
+
+          const { error: logError } = await supabase.from('usage_logs').insert({
+
+            user_id: userId,
+
+            model: targetModel,
+
+            prompt_tokens: promptTokens,
+
+            completion_tokens: completionTokens,
+
+            actual_cost: 0,
+
+            session_id: session_id || null,
+
+            timestamp: new Date().toISOString()
+
+          });
+
+          if (logError) console.error(`[USAGE] Failed to log streamed usage for user ${userId}:`, logError.message);
+
+        }
+
+      );
 
       return;
 
@@ -2814,7 +2960,13 @@ async function openAIChatCompletionsHandler(req, res) {
 
     }
 
-    console.error(`[ALIAS] Error for user ${userId}:`, err.message);
+    console.error(`[ALIAS] Request failed for user ${userId} (${err.code || err.name}).`);
+
+    if ((err.name === 'TimeoutError' || err.code === 'ABORT_ERR') && !res.headersSent) {
+
+      return res.status(504).json({ error: 'AI provider timed out. Please retry shortly.' });
+
+    }
 
     if (isFreeTierRequest) {
 
@@ -2832,9 +2984,9 @@ async function openAIChatCompletionsHandler(req, res) {
 
 // Wire both alias paths — same middleware chain as /chat
 
-app.post('/v1/chat/completions', globalRateLimiter, authenticate, openAIChatCompletionsHandler);
+app.post('/v1/chat/completions', authenticate, globalRateLimiter, openAIChatCompletionsHandler);
 
-app.post('/chat/completions',    globalRateLimiter, authenticate, openAIChatCompletionsHandler);
+app.post('/chat/completions',    authenticate, globalRateLimiter, openAIChatCompletionsHandler);
 
 
 
@@ -2851,33 +3003,22 @@ app.post('/chat/completions',    globalRateLimiter, authenticate, openAIChatComp
 // ---------------------------------------------------------------------------
 
 const ALLOWED_MODELS_BY_TIER = {
-  free:    new Set(['qwen/qwen3-coder-30b-a3b-instruct']),
-  learner: new Set(['qwen/qwen3-coder-30b-a3b-instruct', 'deepseek/deepseek-v4.1-flash-1017']),
-  starter: new Set(['qwen/qwen3-coder-30b-a3b-instruct', 'deepseek/deepseek-v4.1-flash-1017', 'xiaomi/mimo-v2.6-flash']),
-  pro:     new Set(['qwen/qwen3-coder-30b-a3b-instruct', 'deepseek/deepseek-v4.1-flash-1017', 'xiaomi/mimo-v2.6-flash', 'deepseek/deepseek-v4.5-instruct', 'xai/grok-4.1-fast']),
+  free: new Set(MODELS_BY_TIER.free),
+  learner: new Set(MODELS_BY_TIER.learner),
+  starter: new Set(MODELS_BY_TIER.starter),
+  pro: new Set(MODELS_BY_TIER.pro),
 };
 
 function validateModelAccess(tier, requestedModel) {
-  const allowed = ALLOWED_MODELS_BY_TIER[tier] || ALLOWED_MODELS_BY_TIER.free;
-  if (!allowed.has(requestedModel)) {
-    if (tier === 'free') {
-      return { ok: false, status: 403, error: 'Access Denied: This model requires a paid plan. Upgrade to unlock it.' };
-    }
-    if (tier === 'learner' && (requestedModel === 'xiaomi/mimo-v2.6-flash')) {
-      return { ok: false, status: 403, error: 'Access Denied: MiMo v2.6 Flash requires Starter or Pro tier.' };
-    }
-    if ((tier === 'learner' || tier === 'starter') &&
-        (requestedModel === 'xai/grok-4.1-fast' || requestedModel === 'deepseek/deepseek-v4.5-instruct')) {
-      return { ok: false, status: 403, error: 'Access Denied: This model requires Pro tier.' };
-    }
-    return { ok: false, status: 403, error: 'Access Denied: Your current plan does not include this model.' };
-  }
-  return { ok: true };
+  const error = getModelAccessError(tier, requestedModel);
+  return error ? { ok: false, status: 403, error } : { ok: true };
 }
 
-app.post('/api/generate', globalRateLimiter, authenticate, async (req, res) => {
+app.post('/api/generate', authenticate, globalRateLimiter, async (req, res) => {
   const userId = req.user.id;
-  const { requestedModel, messages, stream = false, estimated_tokens } = req.body || {};
+  const body = req.body || {};
+  const requestedModel = body.requestedModel || body.model;
+  const { messages } = body;
 
   // 1. Validate requested model
   if (!requestedModel) {
@@ -2891,7 +3032,7 @@ app.post('/api/generate', globalRateLimiter, authenticate, async (req, res) => {
   let tier = 'free';
   let subscription = null;
   try {
-    const { data: subData } = await supabase
+    const { data: subData, error: subError } = await supabase
       .from('subscriptions')
       .select('*')
       .eq('user_id', userId)
@@ -2903,6 +3044,7 @@ app.post('/api/generate', globalRateLimiter, authenticate, async (req, res) => {
     }
   } catch (err) {
     console.warn(`[API-GENERATE] Subscription lookup failed for ${userId}:`, err.message);
+    return res.status(503).json({ error: 'Unable to verify your subscription. Please try again shortly.' });
   }
 
   // 3. Validate tier → model access
@@ -2911,71 +3053,15 @@ app.post('/api/generate', globalRateLimiter, authenticate, async (req, res) => {
     return res.status(access.status).json({ error: access.error });
   }
 
-  // 4. Enforce token caps
-  if (tier === 'free') {
-    let usage;
-    try {
-      usage = await freeTierAccounting.getUsage(userId);
-    } catch (err) {
-      return res.status(503).json({ error: 'Token accounting temporarily unavailable. Please try again.' });
-    }
-    const estimatedCount = Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages));
-    if (usage.lifetimeTokens + estimatedCount > FREE_TIER_TOKEN_CAP) {
-      return res.status(402).json({
-        error: `Free tier lifetime limit (${FREE_TIER_TOKEN_CAP.toLocaleString()} tokens) reached. Please upgrade to continue.`,
-        upgrade_url: 'albion://settings/billing'
-      });
-    }
-  } else {
-    // Paid tier: check model balance in subscriptions.model_balances
-    try {
-      const { data: sub } = await supabase
-        .from('subscriptions')
-        .select('model_balances')
-        .eq('user_id', userId)
-        .eq('status', 'active')
-        .maybeSingle();
-      const balances = sub?.model_balances || {};
-      const balance = balances[requestedModel] ?? 0;
-      if (balance <= 0) {
-        return res.status(429).json({
-          error: `Monthly allowance for ${requestedModel} is exhausted. Please wait for your next billing cycle or upgrade.`,
-          upgrade_url: 'albion://settings/billing'
-        });
-      }
-    } catch (err) {
-      console.warn(`[API-GENERATE] Balance check failed for ${userId}:`, err.message);
-      // On error, allow through — don't block on accounting failure
-    }
-  }
-
-  // 5. Forward to internal /chat handler (re-use existing routing logic)
-  // Inject requestedModel as model_preference for the existing /chat logic
-  req.body.model_preference = requestedModel;
+  // Reuse the OpenAI-compatible proxy so accounting and provider behavior stay consistent.
+  req.body.model = requestedModel;
   // Mark as from /api/generate for logging
   req.headers['x-albion-api-generate'] = '1';
 
   // Forward to the chat handler directly
   try {
-    // Delegate to the same upstream routing used by /chat
-    const capResult = await checkCapBeforeRoute(userId, {
-      forceModel: requestedModel,
-      hasImages: false,
-      estimatedTokens: Math.max(1, Number(estimated_tokens) || estimateMessagesTokens(messages))
-    });
-
-    if (capResult.capExceeded && !capResult.accountingError) {
-      return res.status(402).json({
-        error: capResult.limitMessage || 'Token cap exceeded.',
-        upgrade_url: 'albion://settings/billing'
-      });
-    }
-
-    // Log and pass through — actual provider call happens via existing /chat infrastructure
     console.log(`[API-GENERATE] user=${userId} tier=${tier} model=${requestedModel}`);
 
-    // Call the same openAI compat handler by forwarding
-    req.url = '/v1/chat/completions';
     return openAIChatCompletionsHandler(req, res);
   } catch (err) {
     console.error('[API-GENERATE] Error:', err.message);
@@ -3082,42 +3168,64 @@ app.post('/api/create-nowpayment-invoice', express.json(), async (req, res) => {
     return res.status(503).json({ error: 'Payment provider not configured.' });
   }
 
+  const { planTier, userId: requestedUserId, email } = req.body || {};
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-  let userId = null;
+  let accountUser = null;
   if (token) {
     try {
       const { data: { user }, error } = await supabase.auth.getUser(token);
-      if (!error && user) userId = user.id;
-    } catch (e) { /* ignore */ }
+      if (error || !user) return res.status(401).json({ error: 'Invalid authorization token.' });
+      accountUser = user;
+    } catch {
+      return res.status(401).json({ error: 'Invalid authorization token.' });
+    }
+    if (requestedUserId && requestedUserId !== accountUser.id) {
+      return res.status(403).json({ error: 'The supplied userId does not match the authenticated account.' });
+    }
+  } else if (requestedUserId && email) {
+    try {
+      const { data, error } = await supabase.auth.admin.getUserById(requestedUserId);
+      if (error || !data?.user || (data.user.email || '').toLowerCase() !== String(email).toLowerCase()) {
+        return res.status(401).json({ error: 'Could not verify the supplied account.' });
+      }
+      accountUser = data.user;
+    } catch {
+      return res.status(401).json({ error: 'Could not verify the supplied account.' });
+    }
   }
-  if (!userId && req.body && req.body.userId) {
-    userId = req.body.userId;
-  }
-  if (!userId) {
-    return res.status(401).json({ error: 'Unauthorized: User ID or valid token required' });
+  if (!accountUser) {
+    return res.status(401).json({ error: 'A valid account token or matching userId and email are required.' });
   }
 
-  const { planTier } = req.body || {};
   if (!planTier || !TIER_PRICES_USD[planTier]) {
     return res.status(400).json({ error: 'Invalid planTier. Must be learner, starter, or pro.' });
   }
 
+  const userId = accountUser.id;
   const priceUsd = TIER_PRICES_USD[planTier];
-  const orderId = `${userId}_${planTier}`;
+  const orderId = `albion_${crypto.randomUUID()}`;
+  const supportedPayCurrencies = ['usdttrc20'];
+  const payCurrency = normalizePayCurrency(req.body?.payCurrency || process.env.NOWPAYMENT_PAY_CURRENCY || 'usdttrc20');
+  if (!isSupportedPayCurrency(payCurrency, supportedPayCurrencies)) {
+    return res.status(400).json({ error: 'Unsupported payment currency.' });
+  }
   const ipnCallbackUrl = process.env.NOWPAYMENT_IPN_CALLBACK_URL || '';
   const successUrl = process.env.NOWPAYMENT_SUCCESS_URL || 'https://albion.dev/payment/success';
   const cancelUrl  = process.env.NOWPAYMENT_CANCEL_URL  || 'https://albion.dev/payment/cancel';
 
   try {
+    if (!ipnCallbackUrl) {
+      return res.status(503).json({ error: 'Payment notifications are not configured.' });
+    }
+
     const invoiceRes = await fetch('https://api.nowpayments.io/v1/invoice', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': NOWPAYMENT_API_KEY },
       body: JSON.stringify({
         price_amount: priceUsd,
         price_currency: 'usd',
-        pay_currency: 'usdttrc20',
+        pay_currency: payCurrency,
         ipn_callback_url: ipnCallbackUrl,
         order_id: orderId,
         order_description: `Albion IDE - ${planTier.charAt(0).toUpperCase() + planTier.slice(1)} Plan (Monthly)`,
@@ -3129,23 +3237,38 @@ app.post('/api/create-nowpayment-invoice', express.json(), async (req, res) => {
     });
 
     if (!invoiceRes.ok) {
-      const errBody = await invoiceRes.text().catch(() => '');
-      console.error(`[NOWPAYMENTS] Invoice creation failed: HTTP ${invoiceRes.status} — ${errBody}`);
+      await invoiceRes.text().catch(() => '');
+      console.error(`[NOWPAYMENTS] Invoice creation failed: HTTP ${invoiceRes.status}.`);
       return res.status(502).json({ error: 'Payment provider returned an error. Please try again.' });
     }
 
     const invoiceData = await invoiceRes.json();
     const invoiceUrl  = invoiceData.invoice_url || invoiceData.checkout_url;
-    if (!invoiceUrl) {
-      console.error('[NOWPAYMENTS] No invoice_url in response:', JSON.stringify(invoiceData));
+    if (!invoiceUrl || (invoiceData.pay_currency && invoiceData.pay_currency.toLowerCase() !== payCurrency)) {
+      console.error('[NOWPAYMENTS] Invoice response omitted checkout data or used an unexpected currency.');
       return res.status(502).json({ error: 'Payment provider did not return a checkout URL.' });
+    }
+
+    const { error: invoiceInsertError } = await supabase.from('albion_nowpayments_invoices').insert({
+      order_id: orderId,
+      invoice_id: invoiceData.id ? String(invoiceData.id) : null,
+      user_id: userId,
+      plan_tier: planTier,
+      expected_amount: priceUsd,
+      price_currency: 'usd',
+      pay_currency: payCurrency,
+      status: 'pending'
+    });
+    if (invoiceInsertError) {
+      console.error('[NOWPAYMENTS] Could not persist invoice metadata.');
+      return res.status(503).json({ error: 'Could not securely register the invoice. Please try again.' });
     }
 
     console.log(`[NOWPAYMENTS] Invoice created for user ${userId}, tier=${planTier}, order_id=${orderId}`);
     return res.status(200).json({ invoice_url: invoiceUrl, order_id: orderId });
   } catch (err) {
-    console.error('[NOWPAYMENTS] Invoice creation error:', err.message);
-    return res.status(500).json({ error: 'Internal error creating invoice.' });
+    console.error(`[NOWPAYMENTS] Invoice creation failed (${err.code || err.name}).`);
+    return res.status(err.name === 'TimeoutError' ? 504 : 500).json({ error: 'Internal error creating invoice.' });
   }
 });
 
@@ -3181,16 +3304,7 @@ app.post(['/webhooks/nowpayments', '/api/webhooks/nowpayments'], express.json(),
     return res.status(401).json({ error: 'Missing signature' });
   }
 
-  // HMAC-SHA512: sort body keys alphabetically then JSON.stringify
-  const sortedBody   = JSON.stringify(req.body, Object.keys(req.body || {}).sort());
-  const expectedSig  = crypto.createHmac('sha512', NOWPAYMENT_IPN_SECRET).update(sortedBody).digest('hex');
-
-  let sigValid = false;
-  try {
-    sigValid = crypto.timingSafeEqual(Buffer.from(expectedSig, 'hex'), Buffer.from(receivedSig, 'hex'));
-  } catch { sigValid = false; }
-
-  if (!sigValid) {
+  if (!req.body || typeof req.body !== 'object' || !verifyNowPaymentsSignature(req.body, receivedSig, NOWPAYMENT_IPN_SECRET)) {
     console.error('[WEBHOOK-NP] Invalid NOWPayments IPN signature — possible spoofing attempt');
     return res.status(401).json({ error: 'Signature mismatch' });
   }
@@ -3198,48 +3312,58 @@ app.post(['/webhooks/nowpayments', '/api/webhooks/nowpayments'], express.json(),
   const payload       = req.body;
   const paymentStatus = (payload.payment_status || '').toLowerCase();
   const orderId       = payload.order_id || '';
-  const paymentId     = String(payload.payment_id || `np_${Date.now()}`);
+  const paymentId     = String(payload.payment_id || '');
+
+  if (!paymentId || !orderId) {
+    return res.status(400).json({ error: 'Missing payment or invoice identifier.' });
+  }
 
   console.log(`[WEBHOOK-NP] Verified IPN: status=${paymentStatus}, order_id=${orderId}, payment_id=${paymentId}`);
 
-  if (processedWebhookIds.has(paymentId)) {
-    return res.status(200).json({ received: true, message: 'Already processed' });
-  }
-
-  // Only activate on finished or confirmed
-  if (paymentStatus !== 'finished' && paymentStatus !== 'confirmed') {
+  // Only a fully finished payment can activate a plan.
+  if (paymentStatus !== 'finished') {
     console.log(`[WEBHOOK-NP] Ignoring non-final status: ${paymentStatus}`);
     return res.status(200).json({ received: true, status: paymentStatus });
   }
 
-  // Parse order_id: "{userId}_{planTier}"
-  const lastUnderscore = orderId.lastIndexOf('_');
-  if (lastUnderscore === -1) {
-    console.error(`[WEBHOOK-NP] Cannot parse order_id: ${orderId}`);
-    return res.status(400).json({ error: 'Invalid order_id format' });
-  }
-  const targetUserId = orderId.slice(0, lastUnderscore);
-  const planTier     = orderId.slice(lastUnderscore + 1).toLowerCase();
-
-  if (!targetUserId || !['learner', 'starter', 'pro'].includes(planTier)) {
-    console.error(`[WEBHOOK-NP] Invalid userId or tier from order_id: ${orderId}`);
-    return res.status(400).json({ error: 'Invalid order_id content' });
-  }
-
   try {
-    const tierSpec = TIER_CONFIG[planTier] || { totalTokens: 2000000, modelBalances: {} };
+    const { data: invoice, error: invoiceError } = await supabase
+      .from('albion_nowpayments_invoices')
+      .select('user_id, plan_tier, expected_amount, price_currency, pay_currency, status')
+      .eq('order_id', orderId)
+      .maybeSingle();
+    if (invoiceError) throw invoiceError;
+    if (!invoice) return res.status(400).json({ error: 'Unknown invoice.' });
+    if (!matchesRegisteredInvoice(invoice, payload)) {
+      return res.status(400).json({ error: 'Payment does not match the registered invoice.' });
+    }
+
+    const planTier = invoice.plan_tier;
+    const tierSpec = TIER_CONFIG[planTier];
     const nowIso = new Date().toISOString();
 
-    const { error: subErr } = await supabase
-      .from('subscriptions')
-      .upsert({
-        user_id: targetUserId,
-        tier: planTier,
-        status: 'active',
-        cycle_start: nowIso,
-        model_balances: tierSpec.modelBalances
-      }, { onConflict: 'user_id' });
-    if (subErr) throw subErr;
+    const { data: activation, error: activationError } = await supabase.rpc('albion_activate_nowpayment_invoice', {
+      p_order_id: orderId,
+      p_payment_id: paymentId,
+      p_payment_status: paymentStatus,
+      p_price_amount: payload.price_amount,
+      p_price_currency: payload.price_currency,
+      p_pay_currency: payload.pay_currency,
+      p_model_balances: tierSpec.modelBalances,
+      p_cycle_start: nowIso
+    });
+    if (activationError) throw activationError;
+
+    const activationStatus = activation?.status;
+    if (activationStatus === 'already_processed') return res.status(200).json({ received: true, message: 'Already processed' });
+    if (activationStatus === 'not_found') return res.status(400).json({ error: 'Unknown invoice.' });
+    if (activationStatus === 'conflict' || activationStatus === 'payment_mismatch') {
+      console.warn(`[WEBHOOK-NP] Rejected invoice/payment mismatch for order ${orderId}.`);
+      return res.status(400).json({ error: 'Payment does not match the registered invoice.' });
+    }
+    if (activationStatus !== 'activated') throw new Error('Unexpected invoice activation result');
+
+    const targetUserId = activation.user_id;
 
     // Set user status to PAID and assign planTier
     try {
@@ -3270,16 +3394,14 @@ app.post(['/webhooks/nowpayments', '/api/webhooks/nowpayments'], express.json(),
 
     console.log(`[WEBHOOK-NP] Activated ${planTier} (status: PAID) for user ${targetUserId} (payment_id: ${paymentId})`);
 
-    const amountUsd = payload.actually_paid || payload.price_amount || 0;
-    const currency  = (payload.pay_currency || 'USDT').toUpperCase();
     const billingRecord = {
       user_id: targetUserId,
       event_type: 'payment_confirmed',
       event_id: paymentId,
       paystack_reference: paymentId,
       provider: 'nowpayments',
-      amount: Number(amountUsd),
-      currency,
+      amount: Number(payload.price_amount),
+      currency: String(payload.price_currency || 'usd').toUpperCase(),
       status: 'success',
       raw_payload: payload
     };
@@ -3293,7 +3415,6 @@ app.post(['/webhooks/nowpayments', '/api/webhooks/nowpayments'], express.json(),
       console.warn('[WEBHOOK-NP] Non-fatal billing_events audit failed:', auditErr.message);
     }
 
-    processedWebhookIds.add(paymentId);
     return res.status(200).json({ received: true });
   } catch (err) {
     console.error('[WEBHOOK-NP] Error processing payment:', err.message);
@@ -3673,7 +3794,9 @@ app.get('/api/pricing', authenticate, async (req, res) => {
 
     if (!error && Array.isArray(data) && data.length > 0) {
 
-      const rows = data.map(r => ({
+      const currentModels = new Set(Object.values(MODEL_IDS));
+
+      const rows = data.filter(r => currentModels.has(r.model || r.model_name)).map(r => ({
 
         model: r.model || r.model_name,
 
@@ -3683,7 +3806,7 @@ app.get('/api/pricing', authenticate, async (req, res) => {
 
       }));
 
-      return res.json(rows);
+      if (rows.length > 0) return res.json(rows);
 
     }
 
@@ -3691,17 +3814,18 @@ app.get('/api/pricing', authenticate, async (req, res) => {
 
     // Default seed fallback if DB table not populated yet.
 
-    // DeepSeek V4.1 Flash blended rate: $0.156 / 1M tokens => $0.000156 / 1K.
+    // Keep prices unset until verified against the provider account.
 
     const fallback = [
 
-      { model: 'deepseek-v4-flash', cost_per_1k: 0.000156, currency: 'USD' },
+      { model: MODEL_IDS.FREE, cost_per_1k: null, currency: 'USD' },
 
-      { model: 'qwen3.6-35b-a3b', cost_per_1k: 0.00025, currency: 'USD' },
+      { model: MODEL_IDS.STARTER_DEEPSEEK, cost_per_1k: null, currency: 'USD' },
 
-      { model: 'deepseek-v4-pro', cost_per_1k: 0.00219, currency: 'USD' },
+      { model: MODEL_IDS.STARTER_MIMO, cost_per_1k: null, currency: 'USD' },
 
-      { model: 'glm-5.2', cost_per_1k: 0.00175, currency: 'USD' }
+      { model: MODEL_IDS.PRO_DEEPSEEK, cost_per_1k: null, currency: 'USD' },
+      { model: MODEL_IDS.PRO_MIMO, cost_per_1k: null, currency: 'USD' }
 
     ];
 
@@ -3737,7 +3861,7 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
       .from('subscriptions')
 
-      .select('tier, cycle_start')
+      .select('tier, cycle_start, model_balances')
 
       .eq('user_id', userId)
 
@@ -3857,7 +3981,7 @@ app.get('/api/user/caps', authenticate, async (req, res) => {
 
     const cycleStart = subscription ? subscription.cycle_start : new Date(0).toISOString();
 
-    const currentTierCaps = tierCaps[tier] || {};
+    const currentTierCaps = mergeModelCaps(tierCaps[tier] || {}, subscription?.model_balances);
 
     const modelUsage = {};
 
